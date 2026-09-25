@@ -32,6 +32,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200,{"notifications":self.db.notifications_for(int(parts[2]))})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="advisory":
                 uid=int(parse_qs(parsed.query).get("user_id",[0])[0]); return self._json(200,self.db.get_advisory(int(parts[2]),uid))
+            if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="verification":
+                uid=int(parse_qs(parsed.query).get("user_id",[0])[0]); return self._json(200,self.db.verification_status(int(parts[2]),uid))
             if parsed.path=="/api/duplicates":
                 q=parse_qs(parsed.query); return self._json(200,{"duplicates":self.db.find_duplicate_reports(int(q.get("product_id",[0])[0]),q.get("version",[""])[0])})
             self._json(404,{"ok":False,"error":"接口不存在"})
@@ -46,6 +48,8 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/members": self.db.add_member(int(b.get("report_id",0)),int(b.get("user_id",0)),str(b.get("member_role","maintainer")),int(b.get("added_by",0))); return self._json(201,{"ok":True})
             if path=="/api/evidence": return self._json(201,{"ok":True,"id":self.db.add_evidence(int(b.get("report_id",0)),str(b.get("name","")),str(b.get("content","")),str(b.get("classification","private")),int(b.get("uploaded_by",0)))})
             if path=="/api/fixes": return self._json(201,{"ok":True,"id":self.db.set_fix_plan(int(b.get("report_id",0)),int(b.get("maintainer_id",0)),str(b.get("plan","")),b.get("target_date"))})
+            if path=="/api/version-checks": return self._json(201,{"ok":True,"id":self.db.record_version_check(int(b.get("report_id",0)),str(b.get("version_key","")),int(b.get("maintainer_id",0)),str(b.get("note","")),str(b.get("result","")))})
+            if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="scope": self.db.update_report_scope(int(parts[2]),int(b.get("user_id",0)),b.get("summary"),b.get("versions"),str(b.get("version_details",""))); return self._json(200,{"ok":True})
             if path=="/api/extensions": return self._json(201,{"ok":True,"id":self.db.extend_embargo(int(b.get("report_id",0)),str(b.get("new_deadline","")),str(b.get("reason","")),int(b.get("coordinator_id",0)))})
             if path=="/api/advisories": return self._json(201,{"ok":True,"id":self.db.create_advisory_draft(int(b.get("report_id",0)),str(b.get("content","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="status": self.db.set_status(int(parts[2]),str(b.get("status","")),int(b.get("user_id",0)),str(b.get("note",""))); return self._json(200,{"ok":True})

@@ -6,6 +6,8 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import verification
+
 
 class DomainError(ValueError):
     """Business rule violation."""
@@ -104,6 +106,16 @@ class VulnerabilityDB:
               plan TEXT NOT NULL,
               target_date TEXT,
               status TEXT NOT NULL DEFAULT 'proposed' CHECK(status IN ('proposed','accepted','done')),
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS version_checks (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+              version_key TEXT NOT NULL,
+              maintainer_id INTEGER NOT NULL REFERENCES users(id),
+              note TEXT NOT NULL,
+              result TEXT NOT NULL CHECK(result IN ('pass','fail')),
+              scope_hash TEXT NOT NULL,
               created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS status_history (
@@ -303,6 +315,7 @@ class VulnerabilityDB:
         )]
         payload["evidence"] = evidence
         payload["fix_plan"] = dict(self.conn.execute("SELECT * FROM fix_plans WHERE report_id=?", (report_id,)).fetchone() or {})
+        payload["verification"] = self._verification(report_id)
         payload["history"] = [dict(r) for r in self.conn.execute("SELECT * FROM status_history WHERE report_id=? ORDER BY id", (report_id,))]
         payload["extensions"] = [dict(r) for r in self.conn.execute("SELECT * FROM extensions WHERE report_id=? ORDER BY id", (report_id,))]
         return payload
@@ -316,6 +329,11 @@ class VulnerabilityDB:
             raise DomainError("报告人不能推进协调状态")
         if new_status not in STATUS_TRANSITIONS.get(report["status"], set()):
             raise DomainError(f"状态不能从 {report['status']} 变为 {new_status}")
+        if new_status == "resolved":
+            verdict = self._verification(report_id)
+            if not verdict["can_resolve"]:
+                blocking = "、".join(verdict["blocking_versions"])
+                raise DomainError(f"仍有版本未通过修复核对: {blocking}")
         now = datetime.now().isoformat()
         with self.transaction():
             self.conn.execute("UPDATE reports SET status=?,updated_at=? WHERE id=?", (new_status, now, report_id))
@@ -341,6 +359,7 @@ class VulnerabilityDB:
                 datetime.strptime(target_date, "%Y-%m-%d")
             except ValueError as exc:
                 raise DomainError("目标日期必须使用 YYYY-MM-DD") from exc
+        old = self.conn.execute("SELECT plan,target_date FROM fix_plans WHERE report_id=?", (report_id,)).fetchone()
         with self.transaction():
             try:
                 cur = self.conn.execute(
@@ -355,7 +374,136 @@ class VulnerabilityDB:
                 plan_id = self.conn.execute("SELECT id FROM fix_plans WHERE report_id=?", (report_id,)).fetchone()["id"]
             else:
                 plan_id = int(cur.lastrowid)
+            if old and (old["plan"] != plan.strip() or (old["target_date"] or "") != (target_date or "")):
+                if self.conn.execute("SELECT 1 FROM version_checks WHERE report_id=? LIMIT 1", (report_id,)).fetchone():
+                    for member in self.conn.execute("SELECT user_id FROM report_members WHERE report_id=?", (report_id,)).fetchall():
+                        self._notify(report_id, member["user_id"], "scope", "修复计划已变更，既有版本核对结论作废，需按新计划重新登记")
         return int(plan_id)
+
+    def _scope_hash(self, report_id: int) -> str:
+        report = self.conn.execute("SELECT summary FROM reports WHERE id=?", (report_id,)).fetchone()
+        versions = [r["version_key"] for r in self.conn.execute("SELECT version_key FROM affected_versions WHERE report_id=?", (report_id,))]
+        plan = self.conn.execute("SELECT plan,target_date FROM fix_plans WHERE report_id=?", (report_id,)).fetchone()
+        return verification.scope_fingerprint(report["summary"], versions, plan["plan"] if plan else "", plan["target_date"] if plan else None)
+
+    def record_version_check(self, report_id: int, version_key: str, maintainer_id: int, note: str, result: str) -> int:
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        user = self._user(maintainer_id)
+        if user["role"] != "maintainer" or not self._member(report_id, maintainer_id):
+            raise DomainError("只有该报告的维护者可以登记版本核对")
+        version_key = version_key.strip()
+        affected = [r["version_key"] for r in self.conn.execute("SELECT version_key FROM affected_versions WHERE report_id=?", (report_id,))]
+        if version_key not in affected:
+            raise DomainError("该版本不在受影响版本列表中")
+        if result not in verification.RESULTS:
+            raise DomainError("核对结果必须是 pass 或 fail")
+        if not note.strip():
+            raise DomainError("处理说明不能为空")
+        if report["status"] in ("published", "rejected"):
+            raise DomainError("已公开或已拒绝的报告不能登记核对")
+        now = datetime.now().isoformat()
+        with self.transaction():
+            cur = self.conn.execute(
+                "INSERT INTO version_checks(report_id,version_key,maintainer_id,note,result,scope_hash,created_at) VALUES(?,?,?,?,?,?,?)",
+                (report_id, version_key, maintainer_id, note.strip(), result, self._scope_hash(report_id), now),
+            )
+            check_id = int(cur.lastrowid)
+            if result == verification.RESULT_FAIL and report["status"] == "resolved":
+                self.conn.execute("UPDATE reports SET status='fixing',updated_at=? WHERE id=?", (now, report_id))
+                self.conn.execute(
+                    "INSERT INTO status_history(report_id,old_status,new_status,changed_by,note,created_at) VALUES(?,?,?,?,?,?)",
+                    (report_id, "resolved", "fixing", maintainer_id, f"版本 {version_key} 复测失败，退回修复中", now),
+                )
+            for member in self.conn.execute("SELECT user_id FROM report_members WHERE report_id=?", (report_id,)).fetchall():
+                self._notify(report_id, member["user_id"], "verification", f"版本 {version_key} 核对结果: {result}")
+        return check_id
+
+    def _verification(self, report_id: int) -> dict:
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        versions = [r["version_key"] for r in self.conn.execute("SELECT version_key FROM affected_versions WHERE report_id=? ORDER BY id", (report_id,))]
+        checks = [dict(r) for r in self.conn.execute(
+            "SELECT c.*,u.name AS maintainer_name FROM version_checks c JOIN users u ON u.id=c.maintainer_id WHERE c.report_id=? ORDER BY c.id",
+            (report_id,),
+        )]
+        scope = self._scope_hash(report_id)
+        progress = verification.version_progress(versions, checks, scope)
+        for entry in progress:
+            check = entry.pop("check")
+            entry["note"] = check["note"] if check else ""
+            entry["result_at"] = check["created_at"] if check else None
+            entry["maintainer"] = check["maintainer_name"] if check else None
+        history = []
+        for check in reversed(checks):
+            check["current"] = verification.is_current(check, scope)
+            history.append(check)
+        return {
+            "report_id": report_id,
+            "report_status": report["status"],
+            "scope_hash": scope,
+            "progress": progress,
+            "failed_versions": verification.failed_versions(progress),
+            "pending_versions": verification.pending_versions(progress),
+            "blocking_versions": verification.blocking_versions(progress),
+            "can_resolve": verification.can_resolve(progress),
+            "checks": history,
+        }
+
+    def verification_status(self, report_id: int, user_id: int) -> dict:
+        if not self.can_view(report_id, user_id):
+            raise DomainError("无权查看该报告")
+        return self._verification(report_id)
+
+    def update_report_scope(self, report_id: int, user_id: int, summary: str | None = None,
+                            versions: list[str] | None = None, version_details: str = "") -> None:
+        actor = self._user(user_id)
+        report = self.conn.execute("SELECT * FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        if actor["role"] != "coordinator":
+            raise DomainError("只有协调员可以修改摘要或受影响版本")
+        if report["status"] in ("published", "rejected"):
+            raise DomainError("已公开或已拒绝的报告不能修改")
+        new_summary = report["summary"] if summary is None else str(summary).strip()
+        if not new_summary:
+            raise DomainError("摘要不能为空")
+        old_versions = [dict(r) for r in self.conn.execute("SELECT version_key,details FROM affected_versions WHERE report_id=? ORDER BY id", (report_id,))]
+        new_versions = None
+        if versions is not None:
+            if not isinstance(versions, (list, tuple)):
+                raise DomainError("版本列表格式无效")
+            new_versions = []
+            for version in versions:
+                key = str(version).strip()
+                if not key:
+                    raise DomainError("版本号不能为空")
+                if key not in new_versions:
+                    new_versions.append(key)
+            if not new_versions:
+                raise DomainError("受影响版本不能为空")
+        changed = new_summary != report["summary"] or (new_versions is not None and new_versions != [v["version_key"] for v in old_versions])
+        if not changed:
+            return
+        now = datetime.now().isoformat()
+        with self.transaction():
+            self.conn.execute("UPDATE reports SET summary=?,updated_at=? WHERE id=?", (new_summary, now, report_id))
+            if new_versions is not None:
+                details = {v["version_key"]: v["details"] for v in old_versions}
+                self.conn.execute("DELETE FROM affected_versions WHERE report_id=?", (report_id,))
+                for key in new_versions:
+                    self.conn.execute(
+                        "INSERT INTO affected_versions(report_id,version_key,details) VALUES(?,?,?)",
+                        (report_id, key, details.get(key, "") or version_details.strip()),
+                    )
+            self.conn.execute(
+                "INSERT INTO status_history(report_id,old_status,new_status,changed_by,note,created_at) VALUES(?,?,?,?,?,?)",
+                (report_id, report["status"], report["status"], user_id, "摘要或受影响版本变更，既有版本核对结论作废", now),
+            )
+            for member in self.conn.execute("SELECT user_id FROM report_members WHERE report_id=?", (report_id,)).fetchall():
+                self._notify(report_id, member["user_id"], "scope", "报告摘要或受影响版本已变更，既有版本核对结论作废，需重新登记")
 
     def extend_embargo(self, report_id: int, new_deadline: str, reason: str, coordinator_id: int) -> int:
         actor = self._user(coordinator_id)

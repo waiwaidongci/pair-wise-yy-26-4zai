@@ -10,11 +10,16 @@ class VulnerabilityFlowTest(unittest.TestCase):
         self.product=self.db.add_product("网关","项目组")
         self.report=self.db.create_report("鉴权绕过",self.product,self.reporter,"特制请求可绕过鉴权","2026-10-30",["3.2.0"])
     def tearDown(self): self.db.close(); os.unlink(self.path)
+    def _to_fixing(self, report=None):
+        report=report or self.report
+        self.db.add_member(report,self.maint,"maintainer",self.coord)
+        self.db.set_status(report,"triaged",self.coord)
+        self.db.set_status(report,"fixing",self.coord)
+        self.db.set_fix_plan(report,self.maint,"增加鉴权前置校验", "2026-10-20")
+        return report
     def _advance_to_resolved(self):
-        self.db.add_member(self.report,self.maint,"maintainer",self.coord)
-        self.db.set_status(self.report,"triaged",self.coord)
-        self.db.set_status(self.report,"fixing",self.coord)
-        self.db.set_fix_plan(self.report,self.maint,"增加鉴权前置校验", "2026-10-20")
+        self._to_fixing()
+        self.db.record_version_check(self.report,"3.2.0",self.maint,"已按修复计划复测通过","pass")
         self.db.set_status(self.report,"resolved",self.coord)
         self.db.create_advisory_draft(self.report,"受影响版本 3.2.0。请升级到 3.2.1。",self.coord)
     def test_full_disclosure_flow_and_early_publish_rejected(self):
@@ -28,11 +33,83 @@ class VulnerabilityFlowTest(unittest.TestCase):
     def test_denies_outsider_and_duplicate_report(self):
         with self.assertRaisesRegex(DomainError,"无权"):
             self.db.get_report_for_user(self.report,self.outsider)
+        with self.assertRaisesRegex(DomainError,"无权"):
+            self.db.verification_status(self.report,self.outsider)
         with self.assertRaisesRegex(DomainError,"重复"):
             self.db.create_report("重复问题",self.product,self.reporter,"相同版本的另一份报告","2026-11-01",["3.2.0"])
         self.db.add_member(self.report,self.maint,"maintainer",self.coord)
         self.db.add_evidence(self.report,"协调材料","secret","coordinator",self.coord)
         visible=self.db.get_report_for_user(self.report,self.maint)
         self.assertEqual([],visible["evidence"])
+    def test_resolve_requires_all_versions_passing(self):
+        self._to_fixing()
+        with self.assertRaisesRegex(DomainError,"未通过修复核对"):
+            self.db.set_status(self.report,"resolved",self.coord)
+        self.db.record_version_check(self.report,"3.2.0",self.maint,"复测通过","pass")
+        self.db.set_status(self.report,"resolved",self.coord)
+    def test_failed_check_blocks_resolution_and_is_listed(self):
+        report=self.db.create_report("越权读取",self.product,self.reporter,"可越权读取他人数据","2026-10-30",["4.0.0","4.1.0"])
+        self._to_fixing(report)
+        self.db.record_version_check(report,"4.0.0",self.maint,"4.0.0 已修复复测通过","pass")
+        self.db.record_version_check(report,"4.1.0",self.maint,"4.1.0 复测仍失败","fail")
+        verdict=self.db.verification_status(report,self.coord)
+        self.assertEqual(["4.1.0"],verdict["failed_versions"])
+        self.assertEqual(["4.1.0"],verdict["blocking_versions"])
+        self.assertFalse(verdict["can_resolve"])
+        with self.assertRaisesRegex(DomainError,"4.1.0"):
+            self.db.set_status(report,"resolved",self.coord)
+        self.assertEqual("fixing",self.db.get_report_for_user(report,self.coord)["status"])
+    def test_retest_keeps_history_and_latest_wins(self):
+        self._to_fixing()
+        self.db.record_version_check(self.report,"3.2.0",self.maint,"第一次复测失败","fail")
+        self.db.record_version_check(self.report,"3.2.0",self.maint,"修复后复测通过","pass")
+        verdict=self.db.verification_status(self.report,self.coord)
+        self.assertEqual(2,len(verdict["checks"]))
+        self.assertEqual("修复后复测通过",verdict["checks"][0]["note"])
+        self.assertTrue(verdict["can_resolve"])
+        self.db.set_status(self.report,"resolved",self.coord)
+    def test_fail_on_resolved_returns_to_fixing(self):
+        self._advance_to_resolved()
+        self.db.record_version_check(self.report,"3.2.0",self.maint,"回归发现仍可利用","fail")
+        self.assertEqual("fixing",self.db.get_report_for_user(self.report,self.coord)["status"])
+        verdict=self.db.verification_status(self.report,self.coord)
+        self.assertEqual(["3.2.0"],verdict["failed_versions"])
+    def test_scope_change_invalidates_checks(self):
+        self._to_fixing()
+        self.db.record_version_check(self.report,"3.2.0",self.maint,"复测通过","pass")
+        self.assertTrue(self.db.verification_status(self.report,self.coord)["can_resolve"])
+        self.db.update_report_scope(self.report,self.coord,summary="特制请求可绕过鉴权（已补充细节）")
+        verdict=self.db.verification_status(self.report,self.coord)
+        self.assertFalse(verdict["can_resolve"])
+        self.assertEqual(["3.2.0"],verdict["pending_versions"])
+        self.assertEqual(1,verdict["progress"][0]["superseded"])
+        with self.assertRaisesRegex(DomainError,"未通过修复核对"):
+            self.db.set_status(self.report,"resolved",self.coord)
+        self.db.record_version_check(self.report,"3.2.0",self.maint,"按新摘要复测通过","pass")
+        self.db.set_status(self.report,"resolved",self.coord)
+    def test_version_and_plan_change_invalidate_checks(self):
+        self._to_fixing()
+        self.db.record_version_check(self.report,"3.2.0",self.maint,"复测通过","pass")
+        self.db.set_fix_plan(self.report,self.maint,"改为统一鉴权中间件","2026-10-25")
+        self.assertFalse(self.db.verification_status(self.report,self.coord)["can_resolve"])
+        self.db.record_version_check(self.report,"3.2.0",self.maint,"按新计划复测通过","pass")
+        self.db.update_report_scope(self.report,self.coord,versions=["3.2.0","3.1.4"])
+        verdict=self.db.verification_status(self.report,self.coord)
+        self.assertEqual(["3.2.0","3.1.4"],verdict["pending_versions"])
+        self.db.record_version_check(self.report,"3.2.0",self.maint,"3.2.0 复测通过","pass")
+        self.db.record_version_check(self.report,"3.1.4",self.maint,"3.1.4 复测通过","pass")
+        self.db.set_status(self.report,"resolved",self.coord)
+    def test_check_validation(self):
+        self.db.add_member(self.report,self.maint,"maintainer",self.coord)
+        with self.assertRaisesRegex(DomainError,"维护者"):
+            self.db.record_version_check(self.report,"3.2.0",self.coord,"复测","pass")
+        with self.assertRaisesRegex(DomainError,"受影响版本"):
+            self.db.record_version_check(self.report,"9.9.9",self.maint,"复测","pass")
+        with self.assertRaisesRegex(DomainError,"pass 或 fail"):
+            self.db.record_version_check(self.report,"3.2.0",self.maint,"复测","maybe")
+        with self.assertRaisesRegex(DomainError,"处理说明"):
+            self.db.record_version_check(self.report,"3.2.0",self.maint," ","pass")
+        with self.assertRaisesRegex(DomainError,"协调员"):
+            self.db.update_report_scope(self.report,self.maint,summary="越权修改")
 
 if __name__=="__main__": unittest.main()
