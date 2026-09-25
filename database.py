@@ -68,6 +68,7 @@ class VulnerabilityDB:
               summary TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'new'
                 CHECK(status IN ('new','triaged','fixing','resolved','published','rejected')),
+              fix_revision INTEGER NOT NULL DEFAULT 0,
               confidential_until TEXT NOT NULL,
               public_at TEXT,
               created_at TEXT NOT NULL,
@@ -79,6 +80,16 @@ class VulnerabilityDB:
               version_key TEXT NOT NULL,
               details TEXT NOT NULL DEFAULT '',
               UNIQUE(report_id, version_key)
+            );
+            CREATE TABLE IF NOT EXISTS version_fixes (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+              version_key TEXT NOT NULL,
+              maintainer_id INTEGER NOT NULL REFERENCES users(id),
+              note TEXT NOT NULL,
+              result TEXT NOT NULL CHECK(result IN ('pass','fail')),
+              tested_at TEXT NOT NULL,
+              revision INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS report_members (
               report_id INTEGER NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
@@ -143,7 +154,31 @@ class VulnerabilityDB:
             );
             """
         )
+        cols = {row[1] for row in self.conn.execute("PRAGMA table_info(reports)")}
+        if "fix_revision" not in cols:
+            self.conn.execute("ALTER TABLE reports ADD COLUMN fix_revision INTEGER NOT NULL DEFAULT 0")
         self.conn.commit()
+
+    # ---- 逐版本修复核对：存储原语（判定逻辑在 verification.py）----
+
+    def fetch_affected_versions(self, report_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM affected_versions WHERE report_id=? ORDER BY id", (report_id,)
+        ).fetchall()
+
+    def fetch_version_fixes(self, report_id: int) -> list[sqlite3.Row]:
+        return self.conn.execute(
+            "SELECT * FROM version_fixes WHERE report_id=? ORDER BY id", (report_id,)
+        ).fetchall()
+
+    def insert_version_fix(self, report_id: int, version_key: str, maintainer_id: int,
+                           note: str, result: str, tested_at: str, revision: int) -> int:
+        cur = self.conn.execute(
+            "INSERT INTO version_fixes(report_id,version_key,maintainer_id,note,result,tested_at,revision) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (report_id, version_key, maintainer_id, note, result, tested_at, revision),
+        )
+        return int(cur.lastrowid)
 
     def seed_demo(self) -> None:
         if self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]:
@@ -316,6 +351,9 @@ class VulnerabilityDB:
             raise DomainError("报告人不能推进协调状态")
         if new_status not in STATUS_TRANSITIONS.get(report["status"], set()):
             raise DomainError(f"状态不能从 {report['status']} 变为 {new_status}")
+        if new_status == "resolved":
+            from verification import FixVerification
+            FixVerification(self).assert_resolvable(report_id)
         now = datetime.now().isoformat()
         with self.transaction():
             self.conn.execute("UPDATE reports SET status=?,updated_at=? WHERE id=?", (new_status, now, report_id))
@@ -334,6 +372,11 @@ class VulnerabilityDB:
             raise DomainError("只有该报告的维护者可以提交修复计划")
         if user["role"] == "maintainer" and not self.can_view(report_id, maintainer_id):
             raise DomainError("无权修改该报告")
+        report = self.conn.execute("SELECT status FROM reports WHERE id=?", (report_id,)).fetchone()
+        if not report:
+            raise DomainError("报告不存在")
+        if report["status"] not in {"fixing", "triaged"}:
+            raise DomainError("报告已离开修复阶段，不能再改修复计划；如需调整请先由协调员退回修复中")
         if not plan.strip():
             raise DomainError("修复计划不能为空")
         if target_date:
@@ -342,19 +385,29 @@ class VulnerabilityDB:
             except ValueError as exc:
                 raise DomainError("目标日期必须使用 YYYY-MM-DD") from exc
         with self.transaction():
+            now = datetime.now().isoformat()
+            existing = self.conn.execute("SELECT * FROM fix_plans WHERE report_id=?", (report_id,)).fetchone()
             try:
                 cur = self.conn.execute(
                     "INSERT INTO fix_plans(report_id,maintainer_id,plan,target_date,created_at) VALUES(?,?,?,?,?)",
-                    (report_id, maintainer_id, plan.strip(), target_date, datetime.now().isoformat()),
+                    (report_id, maintainer_id, plan.strip(), target_date, now),
                 )
             except sqlite3.IntegrityError:
                 cur = self.conn.execute(
                     "UPDATE fix_plans SET maintainer_id=?,plan=?,target_date=?,status='proposed',created_at=? WHERE report_id=?",
-                    (maintainer_id, plan.strip(), target_date, datetime.now().isoformat(), report_id),
+                    (maintainer_id, plan.strip(), target_date, now, report_id),
                 )
                 plan_id = self.conn.execute("SELECT id FROM fix_plans WHERE report_id=?", (report_id,)).fetchone()["id"]
             else:
                 plan_id = int(cur.lastrowid)
+            # 修复计划改动（含首次提交）后旧核对结论作废；内容无变化的重复提交不重登记
+            if existing is None or existing["plan"] != plan.strip() or (existing["target_date"] or "") != (target_date or ""):
+                self.conn.execute("UPDATE reports SET fix_revision=fix_revision+1,updated_at=? WHERE id=?", (now, report_id))
+                for member in self.conn.execute("SELECT user_id FROM report_members WHERE report_id=?", (report_id,)).fetchall():
+                    self._notify(report_id, member["user_id"], "fix_void",
+                                 "修复计划已更新，逐版本修复核对结论全部作废，需按新内容重新登记")
+            else:
+                self.conn.execute("UPDATE reports SET updated_at=? WHERE id=?", (now, report_id))
         return int(plan_id)
 
     def extend_embargo(self, report_id: int, new_deadline: str, reason: str, coordinator_id: int) -> int:

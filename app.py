@@ -4,12 +4,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 from database import DomainError, VulnerabilityDB
+from verification import FixVerification
 
 BASE=Path(__file__).resolve().parent
 DB_PATH=os.environ.get("VULN_DB",str(BASE/"vulnerability.db"))
 
 class Handler(BaseHTTPRequestHandler):
     db=VulnerabilityDB(DB_PATH)
+    verification=FixVerification(db)
     def log_message(self,fmt,*args): return
     def _json(self,status,payload):
         data=json.dumps(payload,ensure_ascii=False).encode()
@@ -27,7 +29,9 @@ class Handler(BaseHTTPRequestHandler):
                 data=(BASE/"static"/"index.html").read_bytes(); self.send_response(200); self.send_header("Content-Type","text/html; charset=utf-8"); self.send_header("Content-Length",str(len(data))); self.end_headers(); self.wfile.write(data); return
             if parsed.path=="/api/state": return self._json(200,self.db.snapshot())
             if len(parts)==3 and parts[:2]==["api","reports"]:
-                uid=int(parse_qs(parsed.query).get("user_id",[0])[0]); return self._json(200,self.db.get_report_for_user(int(parts[2]),uid))
+                uid=int(parse_qs(parsed.query).get("user_id",[0])[0]); payload=self.db.get_report_for_user(int(parts[2]),uid)
+                payload["version_fixes"]=self.verification.progress(int(parts[2]),uid)
+                return self._json(200,payload)
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="notifications":
                 return self._json(200,{"notifications":self.db.notifications_for(int(parts[2]))})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="advisory":
@@ -46,6 +50,9 @@ class Handler(BaseHTTPRequestHandler):
             if path=="/api/members": self.db.add_member(int(b.get("report_id",0)),int(b.get("user_id",0)),str(b.get("member_role","maintainer")),int(b.get("added_by",0))); return self._json(201,{"ok":True})
             if path=="/api/evidence": return self._json(201,{"ok":True,"id":self.db.add_evidence(int(b.get("report_id",0)),str(b.get("name","")),str(b.get("content","")),str(b.get("classification","private")),int(b.get("uploaded_by",0)))})
             if path=="/api/fixes": return self._json(201,{"ok":True,"id":self.db.set_fix_plan(int(b.get("report_id",0)),int(b.get("maintainer_id",0)),str(b.get("plan","")),b.get("target_date"))})
+            if path=="/api/version-fixes": return self._json(201,{"ok":True,"id":self.verification.record(int(b.get("report_id",0)),str(b.get("version","")),int(b.get("maintainer_id",0)),str(b.get("note","")),str(b.get("result","pass")),b.get("tested_at"))})
+            if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="revise":
+                return self._json(200,{"ok":True,**self.verification.revise(int(parts[2]),int(b.get("user_id",0)),b.get("summary"),b.get("versions"))})
             if path=="/api/extensions": return self._json(201,{"ok":True,"id":self.db.extend_embargo(int(b.get("report_id",0)),str(b.get("new_deadline","")),str(b.get("reason","")),int(b.get("coordinator_id",0)))})
             if path=="/api/advisories": return self._json(201,{"ok":True,"id":self.db.create_advisory_draft(int(b.get("report_id",0)),str(b.get("content","")),int(b.get("user_id",0)))})
             if len(parts)==4 and parts[:2]==["api","reports"] and parts[3]=="status": self.db.set_status(int(parts[2]),str(b.get("status","")),int(b.get("user_id",0)),str(b.get("note",""))); return self._json(200,{"ok":True})
